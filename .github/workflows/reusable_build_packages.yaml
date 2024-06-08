@@ -1,0 +1,53 @@
+# This is a reusable workflow used by main and release CI
+on:
+  workflow_call:
+    inputs:
+      makecommand:
+        description: Command used for make
+        required: true
+        type: string
+      suffix:
+        description: Suffix for uploading packages (dev or stable)
+        required: true
+        type: string
+        
+jobs:
+  build-packages:
+    name: build-packages-${{ matrix.arch }}
+    runs-on: ${{ (matrix.arch == 'aarch64' && 'actuated-arm64-8cpu-16gb') || 'ubuntu-22.04' }}
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    # Upgrading to a newer debian version would make the build process generate
+    # binaries that require newer GLIBC version so we need to be based on bullseye for now
+    container: golang:1.22-bullseye
+    steps:
+      - name: Install deps
+        run: |
+          apt update
+          apt install -y --no-install-recommends git awscli make build-essential autoconf libtool pkg-config
+
+      - name: Install updated cmake version ⛓️
+        run: |
+          curl -L -o /tmp/cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v3.22.5/cmake-3.22.5-linux-$(uname -m).tar.gz
+          gzip -d /tmp/cmake.tar.gz
+          tar -xpf /tmp/cmake.tar --directory=/tmp
+          cp -R /tmp/cmake-3.22.5-linux-$(uname -m)/* /usr
+          rm -rf /tmp/cmake-3.22.5-linux-$(uname -m)
+
+      - name: Checkout Plugins ⤵️
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Safe directory
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+          
+      - name: Run build 🏗️
+        run: ${{ inputs.makecommand }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: plugins-${{ matrix.arch }}-${{ inputs.suffix }}.tar.gz
+          path: output/*.tar.gz

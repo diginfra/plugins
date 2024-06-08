@@ -1,0 +1,10 @@
+*~
+.vscode
+.DS_Store
+.idea
+output/
+plugins/*/*.so
+plugins/*/lib*.h
+plugins/dummy_c/nlohmann
+plugins/dummy_c/include
+plugins/dummy_c/*.tar.gz

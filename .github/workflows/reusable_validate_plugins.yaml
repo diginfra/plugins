@@ -1,0 +1,226 @@
+# This is a reusable workflow used by main and release CI
+on:
+  workflow_call:
+    inputs:
+      plugin:
+        description: Name of the plugin that needs to be validated
+        required: true
+        type: string
+      falco-image:
+        description: Docker image of Falco to be used for validation
+        required: true
+        type: string
+      falcoctl-version:
+        description: Version of falcoctl to be used for pulling artifacts
+        required: true
+        type: string
+      plugins-artifact:
+        description: Name of the plugin artifact containing the dev builds
+        required: true
+        type: string
+      rules-checker:
+        description: Path of the rules checker tool built from falcosecurity/rules
+        required: true
+        type: string
+      arch:
+        description: Architecture of the plugins artifacts (x86_64 or aarch64)
+        required: true
+        type: string
+
+jobs:
+  # todo(jasondellaluce): support aarch64 too
+  validate-local:
+    if: inputs.arch == 'x86_64'
+    runs-on: ubuntu-latest
+    container: golang:1.18
+    env:
+      GOFLAGS: '-buildvcs=false'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install system dependencies
+        run: wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq && chmod +x /usr/bin/yq
+
+      - name: Setup plugin config and rules
+        id: get-config
+        run: ./.github/setup-plugin-config-rules.sh ${{ inputs.plugin }}
+
+      - name: Download rules tool
+        uses: actions/download-artifact@v3
+        with:
+          name: rules-tool.tar.gz
+
+      - name: Download plugins
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ inputs.plugins-artifact }}
+          path: /tmp/plugins-${{ inputs.arch }}
+
+      - name: Install plugin and rules
+        run: |
+          set -e pipefail
+
+          arch=${{ inputs.arch }}
+          loaded_plugins="$(cat ${{ steps.get-config.outputs.config_file }} | grep '\- name: ' | cut -d ':' -f 2 | xargs)"
+
+          mkdir -p /etc/falco/falco
+          mkdir -p /usr/share/falco/plugins
+          
+          # avoids git exit status 128: detected dubious ownership in repository
+          git config --global --add safe.directory $(pwd)
+
+          for plugin_name in $loaded_plugins; do
+              echo Installing locally-built plugin "$plugin_name"...
+          
+              # At release time we only build the released plugin, so it's possible
+              # that validation requires a plugin that we haven't built locally.
+              # in those cases, we build it on-the-fly perform validation with it.
+              set +e pipefail
+              packages=$(ls /tmp/plugins-${arch}/${plugin_name}-* || echo "")
+              set -e pipefail
+              if [ -z "$packages" ]; then
+                  echo Building plugin "$plugin_name" temporary packages...
+                  make package/$plugin_name -j4
+                  packages=$(ls $(pwd)/output/${plugin_name}-*)
+              fi
+
+              for archive in $packages; do
+                  echo Extracting archive "$archive"...
+                  mkdir -p tmpdir && cd tmpdir
+                  tar -xvf $archive
+                  cp -r *.yaml /etc/falco/falco || true
+                  cp -r *.so /usr/share/falco/plugins || true
+                  cd .. && rm -fr tmpdir
+              done
+          done
+
+      - name: Validate plugin and rules
+        run: |
+          # craft an empty rules file if none is available.
+          # this ensures that the plugin gets still loaded even if it has no rules.
+          rules_files=""
+          if [ ! -d "${{ steps.get-config.outputs.rules_dir }}" ]; then
+            touch tmp_rules.yaml
+            rules_files="./tmp_rules.yaml"
+          else
+            rules_files=$(ls ${{ steps.get-config.outputs.rules_dir }}/*)
+          fi
+
+          ./.github/validate-rules.sh \
+            "${{ inputs.falco-image }}" \
+            "${{ inputs.rules-checker }}" \
+            "${{ steps.get-config.outputs.config_file }}" \
+            "$rules_files"
+
+  # todo(jasondellaluce): support aarch64 too
+  validate-falcoctl:
+    if: inputs.arch == 'x86_64'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install system dependencies
+        run:  sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq && sudo chmod +x /usr/bin/yq
+      
+      - name: Setup plugin config and rules
+        id: get-config
+        run: ./.github/setup-plugin-config-rules.sh ${{ inputs.plugin }}
+
+      - name: Download plugins
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ inputs.plugins-artifact }}
+          path: /tmp/plugins-${{ inputs.arch }}
+
+      - name: Download rules tool
+        uses: actions/download-artifact@v3
+        with:
+          name: rules-tool.tar.gz
+
+      - name: Download falcoctl
+        run: |
+          curl --fail -LS "https://github.com/falcosecurity/falcoctl/releases/download/v${{ inputs.falcoctl-version }}/falcoctl_${{ inputs.falcoctl-version }}_linux_${{ inputs.arch == 'x86_64' && 'amd64' || 'arm64' }}.tar.gz" | tar -xz
+          sudo install -o root -g root -m 0755 falcoctl /usr/local/bin/falcoctl
+  
+      # note(jsondellaluce): exploring the set of all dependencies including their
+      # alternatives and all the possible combinations of different versions would
+      # result in a combinatorial explosion. As such, we take the simple route
+      # of exploring a subset of all the possible combinations (which does not
+      # include the deps alternatives) that attempts resembling real-world use cases.
+      #
+      # We validate each ruleset by loading its plugin dependencies at different
+      # versions, with the following logic:
+      # - for all the plugin dependencies defined in the ruleset:
+      #   - we take the plugin version of the dependency
+      #   - we set the patch version number to 0, to forbid patch-level dependencies
+      #     (e.g. falco will fail the validation if v0.8.1 of a plugin is required and we provide v0.8.0)
+      # - iteratively:
+      #   - for all the plugin dependencies defined in the ruleset:
+      #     - we download the plugin at the given version of the dependency by using falcoctl
+      #     - we increase the minor version number of the plugin by 1
+      #   - we validate the ruleset with Falco and stop if we encounter an error
+      #   - if falcoctl didn't find any updated plugin with the increased minor
+      #     version for any of the plugin deps, we stop iterating
+      #
+      # todo(jasondellaluce): improve this by attempting more cases
+      # todo(jasondellaluce): if we skip one minor version (e.g. bump from v0.1.0
+      # to v0.3.0), this algorithm would stop before finishing the exploration
+      - name: Validate plugin and rules
+        run: |
+          set -e pipefail
+
+          if [ ! -d "${{ steps.get-config.outputs.rules_dir }}" ]; then
+            exit 0
+          fi
+
+          sudo mkdir -p /usr/share/falco/plugins
+
+          rules_files=$(ls ${{ steps.get-config.outputs.rules_dir }}/*)
+          deps=$(./.github/extract-plugins-deps-from-rulesfile.sh \
+              "${{ inputs.plugin }}" \
+              "$rules_files")
+          echo "Deps: ${deps}"
+          ver_diff=0
+          has_updates=1
+          while [ "$has_updates" -eq 1 ]; do
+            has_updates=0
+            for dep in $deps; do
+              echo "Plugin: ${dep}"
+              plugin_name=$(echo $dep | tr -d '"' | cut -d ':' -f 1)
+
+              # forcing zero patch version to forbid patch-like dependencies
+              # bumping minor version at every iteration
+              plugin_ver=$(echo $dep | tr -d '"' | cut -d ':' -f 2)
+              plugin_ver_major=$(echo $plugin_ver | cut -d '.' -f 1)
+              plugin_ver_minor=$(expr $(echo $plugin_ver | cut -d '.' -f 2) + $ver_diff)
+              plugin_ver_patch=0 
+              plugin_ver="${plugin_ver_major}.${plugin_ver_minor}.${plugin_ver_patch}"
+
+              set +e pipefail
+              sudo falcoctl artifact install ${plugin_name}:${plugin_ver}
+              if [ $? -eq 0 ]; then
+                echo Installed plugin "${plugin_name}" at version "${plugin_ver}"
+                has_updates=1
+              else
+                echo Can\'t pull plugin "${plugin_name}" at version "${plugin_ver}"
+                echo Attempt installing locally-built plugin "${plugin_name}"...
+                for archive in $(ls /tmp/plugins-${{ inputs.arch }}/${plugin_name}-*); do
+                  echo Extracting archive "$archive"...
+                  mkdir -p tmpdir && pushd tmpdir
+                  tar -xvf $archive
+                  sudo cp -r *.so /usr/share/falco/plugins || true
+                  popd && rm -fr tmpdir
+                done
+              fi
+              set -e pipefail
+            done
+            ver_diff=$(expr $ver_diff + 1)
+
+            ./.github/validate-rules.sh \
+              "${{ inputs.falco-image }}" \
+              "${{ inputs.rules-checker }}" \
+              "${{ steps.get-config.outputs.config_file }}" \
+              "$rules_files"
+          done 
